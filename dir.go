@@ -1,23 +1,25 @@
 package dirutil
-
-import "io/ioutil"
-import "net/http"
-import "net/url"
-import "io"
-import "os"
-import "mime"
-import "path"
-import "fmt"
-import "flag"
-import "strings"
-import "strconv"
-import "text/template"
-import "container/list"
-import "compress/gzip"
-import "compress/zlib"
-import "time"
-import "github.com/davidwalter1/tmplutil"
-
+import (
+	"sort"
+	"io/ioutil"
+	"net/http"
+	"net/url"
+	"io"
+	"os"
+	"mime"
+	"path"
+	"fmt"
+	"flag"
+	"strings"
+	"strconv"
+	"text/template"
+	"container/list"
+	"compress/gzip"
+	"compress/zlib"
+	"time"
+	"github.com/davidwalter1/tmplutil"
+	// "golang.org/x/text/collate"
+)
 var fmap = template.FuncMap {
     "segue"     : tmplutil.Segue,
     "isMarkdown": tmplutil.IsMarkdown,
@@ -28,8 +30,9 @@ var fmap = template.FuncMap {
 }				  
 
 var RootFolder		   *string
-var UsesGzip  		   *bool   = flag.Bool("gzip",             true,  "Enables gzip/zlib compression")
-var ListDirectories    *bool   = flag.Bool("list-directories", false, "list subdirectories, disabled by default")
+var DirTemplate        *string = flag.String ( "dir-html-template",   "dir.html",	"header filename")
+var UsesGzip  		   *bool   = flag.Bool	 ("gzip",             	  true,  		"Enables gzip/zlib compression")
+var ListDirectories    *bool   = flag.Bool	 ("list-directories", 	  false, 		"list subdirectories, disabled by default")
 
 const serverUA = "DW/0.0.1"
 const fs_maxbufsize = 4096 // 4096 bits = default page size on OSX
@@ -91,6 +94,26 @@ func DirectoryListing(w http.ResponseWriter, req *http.Request) {
 	handleFile( w, req )
 }
 
+// From ioutil
+// byName implements sort.Interface.
+type FileByName []os.FileInfo
+
+func (f FileByName) Len() int           { return len(f) }
+func (f FileByName) Less(i, j int) bool { return f[i].Name() < f[j].Name() }
+func (f FileByName) Swap(i, j int)      { f[i], f[j] = f[j], f[i] }
+
+type ByName []string
+
+func (f ByName) Len() int           { return len(f) }
+func (f ByName) Less(i, j int) bool { return f[i] < f[j] }
+func (f ByName) Swap(i, j int)      { f[i], f[j] = f[j], f[i] }
+
+type ByNameIgnoreCase []string
+
+func (f ByNameIgnoreCase) Len() int           { return len(f) }
+func (f ByNameIgnoreCase) Less(i, j int) bool { return strings.ToLower( f[i] ) < strings.ToLower( f[j] ) }
+func (f ByNameIgnoreCase) Swap(i, j int)      { f[i], f[j] = f[j], f[i] }
+
 func handleDirectory(f *os.File, w http.ResponseWriter, req *http.Request) {
 	names, _ := f.Readdir(-1)
 
@@ -105,7 +128,7 @@ func handleDirectory(f *os.File, w http.ResponseWriter, req *http.Request) {
 	// Otherwise, generate folder content.
 	children_dir_tmp := list.New()
 	children_files_tmp := list.New()
-
+	sort.Sort(FileByName(names))
 	for _, val := range names {
 		if val.Name()[0] == '.' {
 			continue
@@ -121,10 +144,16 @@ func handleDirectory(f *os.File, w http.ResponseWriter, req *http.Request) {
 	// And transfer the content to the final array structure
 	children_dir := copyToArray(children_dir_tmp)
 	children_files := copyToArray(children_files_tmp)
-	filename  := "directory-listing.thtml" 
+	sort.Sort( ByNameIgnoreCase( children_files ) )
+	if DirTemplate == nil {
+		tmplutil.Error.Printf( "No file for directory html template specified" )
+		os.Exit( 1 )
+	}
+	filename  := *DirTemplate
     text, err := ioutil.ReadFile( filename )
     if err != nil {
-        fmt.Printf( "Error: Load( %s )\n", filename )
+		tmplutil.Error.Printf( "File read error %s\n" , filename )
+		os.Exit( 1 )
     }
 	if text != nil { // dirlisting_tpl != nil {
 		tpl, err := template.New("dir-template").Funcs( fmap ).Parse( string( text ) )
@@ -144,6 +173,23 @@ func handleDirectory(f *os.File, w http.ResponseWriter, req *http.Request) {
 }
 
 func serveFile(filepath string, w http.ResponseWriter, req *http.Request) {
+	if tmplutil.IsHTML( filepath ) || tmplutil.IsWiki( filepath ) ||  tmplutil.IsMarkdown( filepath ) {
+		tmplutil.Info.Printf( fmt.Sprintf( "Host %-20s Client %-20s URL.Path [%s] %s\n", 
+			req.Host, req.RemoteAddr, req.URL.Path, tmplutil.LogString( req ) ) )
+		if len( filepath ) > 0 && filepath[0] == '/' {
+			filepath = filepath[1:]
+		}
+		text := tmplutil.Load( filepath )
+		if text != nil {
+			w.Header().Set("Content-Encoding", "text/plain")
+			w.Write( []byte(tmplutil.WrapPre( filepath, *text )) )
+			// w.Write( html.HTML( text ) )
+		}
+		return
+	}
+
+	tmplutil.Info.Printf( fmt.Sprintf( "Host %-20s Client %-20s URL.Path [%s] %s\n", 
+		req.Host, req.RemoteAddr, req.URL.Path, tmplutil.LogString( req ) ) )
 	// Opening the file handle
 	f, err := os.Open(filepath)
 	if err != nil {
@@ -175,10 +221,12 @@ func serveFile(filepath string, w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
+
 	w.Header().Set("Last-Modified", statinfo.ModTime().Format(http.TimeFormat))
 
 	// Content-Type handling
 	query, err := url.ParseQuery(req.URL.RawQuery)
+	tmplutil.Info.Printf( fmt.Sprintf( "Host %-20s Client %-20s URL.Path [%s] %s %s %s query %s\n", req.Host, req.RemoteAddr, req.URL.Path, tmplutil.LogString( req ), "filepath", filepath, query ) )
 
 	if err == nil && len(query["dl"]) > 0 { // The user explicitedly wanted to download the file (Dropbox style!)
 		w.Header().Set("Content-Type", "application/octet-stream")
@@ -204,7 +252,6 @@ func serveFile(filepath string, w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Range",
 			fmt.Sprintf("bytes %d-%d/%d", start_byte, statinfo.Size()-1, statinfo.Size()))
 	}
-
 	// Manage gzip/zlib compression
 	output_writer := w.(io.Writer)
 
@@ -258,10 +305,12 @@ func serveFile(filepath string, w http.ResponseWriter, req *http.Request) {
 
 func handleFile(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Server", serverUA)
-
 	filepath := path.Join((*RootFolder), path.Clean(req.URL.Path))
+	tmplutil.Info.Printf( fmt.Sprintf( "Host %-20s Client %-20s URL.Path [%s] %s %s %s\n", 
+		req.Host, req.RemoteAddr, req.URL.Path, tmplutil.LogString( req ), "filepath", filepath ) )
 	serveFile(filepath, w, req)
-	tmplutil.Log( req )
+	tmplutil.Info.Printf( fmt.Sprintf( "Host %-20s Client %-20s URL.Path [%s] %s %s %s\n", 
+		req.Host, req.RemoteAddr, req.URL.Path, tmplutil.LogString( req ), "filepath", filepath ) )
 }
 
 func parseCSV(data string) []string {
